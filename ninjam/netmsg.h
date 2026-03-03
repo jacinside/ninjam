@@ -29,8 +29,8 @@
 #ifndef _NETMSG_H_
 #define _NETMSG_H_
 
-#include "../WDL/queue.h"
-#include "../WDL/jnetlib/jnetlib.h"
+#include "WDL/queue.h"
+#include "WDL/jnetlib/jnetlib.h"
 #ifndef _WIN32
 #include <netinet/tcp.h>
 #endif

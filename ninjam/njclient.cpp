@@ -28,11 +28,11 @@
 #include <stdarg.h>
 #include "njclient.h"
 #include "mpb.h"
-#include "../WDL/pcmfmtcvt.h"
-#include "../WDL/wavwrite.h"
-#include "../WDL/wdlcstring.h"
+#include "WDL/pcmfmtcvt.h"
+#include "WDL/wavwrite.h"
+#include "WDL/wdlcstring.h"
 
-#include "../WDL/win32_utf8.h"
+#include "win32_utf8_compat.h"
 
 #define NJ_ENCODER_FMT_TYPE MAKE_NJ_FOURCC('O','G','G','v')
 
@@ -42,7 +42,7 @@
 
 #define VorbisEncoderInterface I_NJEncoder 
 #define VorbisDecoderInterface I_NJDecoder 
-#include "../WDL/vorbisencdec.h"
+#include "vorbisencdec.h"
 #undef VorbisEncoderInterface
 #undef VorbisDecoderInterface
 
@@ -692,6 +692,11 @@ void NJClient::writeLog(const char *fmt, ...)
 
 }
 
+static FILE* fopenUTF8(const char* filename, const char* mode) {
+    // On macOS, standard fopen supports UTF-8 paths
+    return fopen(filename, mode);
+}
+
 void NJClient::SetLogFile(char *name)
 {
   m_log_cs.Enter();
@@ -965,6 +970,10 @@ int NJClient::Run() // nonzero if sleep ok
       if (m_oggWrite&&m_oggComp)
       {
         m_oggComp->Encode(f,hl,1,hl);
+        if (!f || hl <= 0 || !m_oggComp) {
+            // debug print o simplemente saltear
+            break;
+        }
         if (m_oggComp->Available())
         {
           fwrite((char *)m_oggComp->Get(),1,m_oggComp->Available(),m_oggWrite);
@@ -2736,6 +2745,18 @@ void NJClient::GetLocalChannelProcessor(int ch, void **func, void **inst)
   if (inst) *inst=c->cbf_inst; 
 }
 
+//ch  int  Número de canal local a configurar
+//name  const char*  Nombre visible del canal (ej: "guitarra", "voz")
+//setsrcch  bool  Si es true, actualiza srcch
+//srcch  int  Índice de entrada de audio: 0 para mono, 1024 para estéreo
+//setbitrate  bool  Si es true, actualiza el bitrate
+//bitrate  int  Bitrate de codificación OGG (ej: 64 o 128 kbps)
+//setbcast  bool  Si es true, actualiza si el canal transmite o no
+//broadcast  bool  true = transmite audio al servidor; false = no
+//setoutch  bool  Si es true, actualiza el canal de salida (monitoring)
+//outch  int  Canal de salida local. 0 para L, 1024 para estéreo
+//setflags  bool  Si es true, actualiza los flags
+//flags  int  Modos especiales (ej: 2 = voz en vivo, 4 = sesión)
 void NJClient::SetLocalChannelInfo(int ch, const char *name, bool setsrcch, int srcch,
                                    bool setbitrate, int bitrate, bool setbcast, bool broadcast, bool setoutch, int outch, bool setflags, int flags)
 {  
@@ -2892,7 +2913,7 @@ void NJClient::SetWorkDir(char *path)
 }
 
 
-RemoteUser_Channel::RemoteUser_Channel() : volume(0.25f), pan(0.0f), out_chan_index(0), flags(0), dump_samples(0), ds(NULL)
+RemoteUser_Channel::RemoteUser_Channel() : volume(1.0f), pan(0.0f), out_chan_index(0), flags(0), dump_samples(0), ds(NULL)
 {
   decode_peak_vol[0]=decode_peak_vol[1]=0.0;
   memset(next_ds,0,sizeof(next_ds));

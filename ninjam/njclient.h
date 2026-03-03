@@ -66,14 +66,14 @@
 #endif
 #include <stdio.h>
 #include <time.h>
-#include "../WDL/wdlstring.h"
-#include "../WDL/ptrlist.h"
-#include "../WDL/jnetlib/jnetlib.h"
-#include "../WDL/sha.h"
-#include "../WDL/rng.h"
-#include "../WDL/mutex.h"
+#include "WDL/wdlstring.h"
+#include "WDL/ptrlist.h"
+#include "WDL/jnetlib/jnetlib.h"
+#include "WDL/sha.h"
+#include "WDL/rng.h"
+#include "WDL/mutex.h"
 
-#include "../WDL/wavwrite.h"
+#include "WDL/wavwrite.h"
 
 #include "netmsg.h"
 
@@ -207,7 +207,8 @@ public:
   }
 
   int GetSampleRate() const { return m_srate; }
-
+  int m_interval_pos;
+    
 protected:
   double output_peaklevel[2];
 
@@ -249,7 +250,7 @@ protected:
   int m_loopcnt;
   int m_active_bpm, m_active_bpi;
   int m_interval_length;
-  int m_interval_pos, m_metronome_state, m_metronome_tmp,m_metronome_interval;
+  int m_metronome_state, m_metronome_tmp,m_metronome_interval;
   double m_metronome_pos;
 
   int m_metro_chidx, m_remote_chanoffs, m_local_chanoffs;
