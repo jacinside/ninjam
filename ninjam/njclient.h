@@ -135,6 +135,7 @@ public:
 
   const char *GetUser() { return m_user.Get(); }
   const char *GetHostName() { return m_host.Get(); }
+  bool GetServerVideoSupported() { return m_server_video_supported; }
 
   float GetActualBPM() { return (float) m_active_bpm; }
   int GetBPI() { return m_active_bpi; }
@@ -204,6 +205,45 @@ public:
   int (*ChannelMixer)(void *userData, float **inbuf, int in_offset, int innch, int chidx, float *outbuf, int len);
   void *ChannelMixer_User;
 
+  // Raw data channel support (for non-audio payloads like video)
+  // eventType: 0=begin, 1=data, 2=end
+  typedef void (*RawDataCallback)(void *userData, int eventType,
+                                   const unsigned char *guid, unsigned int fourcc,
+                                   const char *username, int chidx,
+                                   const void *data, int dataLen);
+  RawDataCallback RawData_Callback;
+  void *RawData_User;
+
+  // Send raw data: call Begin to start a new interval, then Write chunks, final Write with isEnd=true
+  void RawDataSendBegin(unsigned char outGuid[16], unsigned int fourcc, int chidx, int estsize);
+  void RawDataSendWrite(const unsigned char guid[16], const void *data, int dataLen, bool isEnd);
+
+  // Called when audio interval swaps (audio starts playing new interval)
+  typedef void (*IntervalSwapCallback)(void *userData);
+  IntervalSwapCallback IntervalSwap_Callback;
+  void *IntervalSwap_User;
+
+  // Called from AudioProc() to deliver individual video frames at audio clock rate.
+  // Each call delivers one raw H.264 chunk (or SPS/PPS for frameIndex==0).
+  // userData, username, chidx, fourcc, frameIndex, frameCount, data, dataLen
+  typedef void (*VideoFrameReadyCallback)(void *userData, const char *username, int chidx,
+                                           unsigned int fourcc, int frameIndex, int totalFrames,
+                                           const void *data, int dataLen);
+  VideoFrameReadyCallback VideoFrameReady_Callback;
+  void *VideoFrameReady_User;
+
+  // Video channel management -- interval BEGIN/END driven from on_new_interval()
+  void SetVideoChannel(int chidx, unsigned int fourcc);
+  void StopVideoChannel();
+  void QueueVideoFrame(const void *data, int len);
+  void SetVideoSPSPPS(const void *data, int len);
+
+  // Reset every remote VideoRecvState so accumulated buffers and stale
+  // GUID/sync state from a background interruption can't drift the
+  // video-vs-audio alignment after foreground. Same cleanup as USER-LEAVE
+  // but applied to all streams without removing them.
+  void ResetAllVideoSyncState();
+
   WDL_Mutex m_remotechannel_rd_mutex;
 
   bool is_likely_lobby() const {
@@ -232,6 +272,8 @@ protected:
   int m_status;
   int m_max_localch;
   int m_connection_keepalive;
+  int m_sync_interval_cnt; // debug: interval counter for sync logging
+  bool m_server_video_supported; // server advertised video capability (bit 1 of server_caps)
   FILE *m_logFile;
 #ifndef NJCLIENT_NO_XMIT_SUPPORT
   FILE *m_oggWrite;
@@ -273,9 +315,158 @@ protected:
   WDL_PtrList<RemoteUser> m_remoteusers;
   WDL_PtrList<RemoteDownload> m_downloads;
 
+  // Raw data send queue (thread-safe: any thread pushes, Run() drains under gsMtx)
+  struct RawDataQueueItem {
+    int type; // 0=begin, 1=data/end
+    unsigned char guid[16];
+    unsigned int fourcc;
+    int chidx;
+    int estsize;
+    int flags; // &1 = end
+    WDL_HeapBuf data;
+  };
+  WDL_PtrList<RawDataQueueItem> m_rawdata_sendq;
+  WDL_Mutex m_rawdata_sendq_cs;
+
+  // Raw data receive tracking
+  struct RawDataDownloadTracker {
+    unsigned char guid[16];
+    unsigned int fourcc;
+    char username[256];
+    int chidx;
+  };
+  WDL_PtrList<RawDataDownloadTracker> m_rawdata_downloads;
+
   WDL_HeapBuf tmpblock;
 
   int find_unused_output_channel_pair() const;
+
+  // Video channel state -- interval BEGIN/END managed by on_new_interval()
+  bool m_video_active;
+  unsigned int m_video_fourcc;
+  int m_video_chidx;
+  unsigned char m_video_guid[16];
+  bool m_video_interval_open;
+  WDL_HeapBuf m_video_spspps;
+  WDL_Mutex m_video_spspps_cs;
+
+  // Video receive pipeline -- per-user buffers for multi-stream support.
+  // Each remote video stream gets its own accumulating/next/playing pipeline.
+  struct VideoRecvBuffer {
+    WDL_HeapBuf data;
+    WDL_TypedBuf<int> frameOffsets;
+    int frameCount;
+    char username[256];
+    unsigned char guid[16];
+    unsigned int fourcc;
+    int chidx;
+    int interval_seq; // receiver's interval counter at BEGIN time
+    unsigned char audio_guid[16]; // sender's audio ch0 GUID for this interval (from marker chunk, zero=no marker)
+    bool active;
+    // Multi-write reassembly: when a logical frame is split across raw-data WRITEs by the
+    // sender's MAX_ENC_BLOCKSIZE chunker, we accumulate bytes here until the frame is
+    // complete. `pending_remaining` is bytes still expected before the in-progress frame
+    // is finalized (frameCount++ happens at completion, not on every WRITE).
+    int pending_remaining;
+    int sender_seq; // sender's m_sync_interval_cnt for this interval (from 24B marker, -1=unknown)
+    VideoRecvBuffer() : frameCount(0), fourcc(0), chidx(0), interval_seq(-1), active(false), pending_remaining(0), sender_seq(-1) { username[0] = 0; memset(guid, 0, 16); memset(audio_guid, 0, 16); }
+    void reset() { data.Resize(0); frameOffsets.Resize(0); frameCount = 0; fourcc = 0; chidx = 0; interval_seq = -1; active = false; pending_remaining = 0; sender_seq = -1; username[0] = 0; memset(guid, 0, 16); memset(audio_guid, 0, 16); }
+    void copyFrom(const VideoRecvBuffer &src) {
+      fourcc = src.fourcc; chidx = src.chidx; active = src.active; frameCount = src.frameCount;
+      memcpy(username, src.username, sizeof(username));
+      memcpy(guid, src.guid, 16);
+      int sz = src.data.GetSize();
+      data.Resize(sz, false);
+      if (sz > 0) memcpy(data.Get(), src.data.Get(), sz);
+      // All offsets, including the in-progress frame's start (frameCount + 1 entries
+      // while pending_remaining > 0): copies happen mid-frame at interval swaps.
+      const int noffs = src.frameOffsets.GetSize();
+      frameOffsets.Resize(noffs, false);
+      if (noffs > 0) memcpy(frameOffsets.Get(), src.frameOffsets.Get(), noffs * sizeof(int));
+      interval_seq = src.interval_seq;
+      memcpy(audio_guid, src.audio_guid, 16);
+      pending_remaining = src.pending_remaining;
+      sender_seq = src.sender_seq;
+    }
+  };
+
+  // One frame held in the voice-chat video delay line. Enqueued on the net thread
+  // (frame-on-arrival), released by the pump on the audio thread after deliver_at_ms.
+  struct LiveDelayFrame {
+    double deliver_at_ms;
+    unsigned int fourcc;
+    int frame_idx;
+    int total_frames;
+    WDL_HeapBuf data; // frame bytes, 4B length-prefix already stripped
+  };
+
+  // Per-user video receive state.
+  // Pipeline: accumulating (during interval download) -> next (after start/END) ->
+  // pending (1-swap defer to align with audio output) -> playing. The pending slot adds
+  // exactly one swap of latency so the video's first frame appears at the same moment
+  // the matching audio becomes audible (audio's natural decoder/output-buffer lag is
+  // ~1 interval). Going to 2 slots overshoots by one interval ("video se ve tarde").
+  struct VideoRecvState {
+    VideoRecvBuffer accumulating;
+    VideoRecvBuffer next;
+    VideoRecvBuffer pending; // matched at SWAP N, moves to playing at SWAP N+1
+    VideoRecvBuffer playing;
+    // Video whose audio is already in the receiver's queue (next_ds) but not yet
+    // playing: the audio runs more than one interval behind (an extra interval
+    // stays queued after a gap or a stalled audio clock). Held here, oldest first,
+    // until its audio becomes ds, then it takes the DS path. Same depth as the
+    // audio queue.
+    VideoRecvBuffer awaiting[2];
+    int awaiting_count;
+    int frame_idx;
+    int expected_frames;
+    bool append_active;
+    bool append_to_next;
+    bool append_to_pending; // routing for late WRITEs when video is held in `pending` waiting for SWAP+1 promote
+    unsigned char append_guid[16];
+    // Stable identifiers -- set at creation, never reset. accumulating's username/chidx
+    // can be cleared by reset(), so we can't rely on those for stream lookup.
+    char stream_username[256];
+    int stream_chidx;
+    char key[280]; // "username:chidx"
+    int  empty_count;           // consecutive SWAPs with no video data
+    int  hold_count;            // consecutive SWAPs where GUID mismatch held video
+    unsigned char prev_ds_guid[16]; // ds->guid from the previous SWAP -- video marker is 1 SWAP behind ds
+    bool synced;                // true once we have aligned at least once via DS or PREV match
+    int  last_played_sender_seq; // sender_seq of the last interval we played (-1 if never)
+    unsigned char last_played_audio_guid[16]; // audio_guid of the last interval we played
+    int  drop_resync_count;     // diagnostic: number of force-resyncs (HOLD cap exceeded)
+    int  live_frame_idx;        // voice-chat (flags&2) live video: per-interval frame counter (reset on BEGIN) for frame-on-arrival delivery
+    WDL_PtrList<LiveDelayFrame> live_delay_q; // voice-chat video delay line (~audio buffer depth) to align live video with audio
+    VideoRecvState() : awaiting_count(0), frame_idx(0), expected_frames(0), append_active(false), append_to_next(false), append_to_pending(false), stream_chidx(0),
+                       empty_count(0), hold_count(0), synced(false), last_played_sender_seq(-1), drop_resync_count(0), live_frame_idx(0) {
+      memset(append_guid, 0, 16); key[0] = 0; stream_username[0] = 0; memset(prev_ds_guid, 0, 16);
+      memset(last_played_audio_guid, 0, 16);
+    }
+    ~VideoRecvState() { live_delay_q.Empty(true); }
+  };
+
+  WDL_PtrList<VideoRecvState> m_video_streams;
+  WDL_Mutex m_video_recv_cs;
+
+  // Each remote audio channel's queue (ds, next_ds[0], next_ds[1]) as of the last
+  // interval swap. Captured under m_users_cs in on_new_interval so video matching
+  // can read it inside m_video_recv_cs without taking m_users_cs there (the Run
+  // thread takes m_users_cs first, then m_video_recv_cs).
+  struct AudioQueueEntry {
+    char username[256];
+    unsigned char guid[3][16]; // [0]=ds (playing), [1]=next_ds[0], [2]=next_ds[1]
+    bool has[3];
+  };
+  WDL_TypedBuf<AudioQueueEntry> m_audio_queue;
+  // 0: the user's audio with this guid is playing; 1, 2: it is queued that many
+  // intervals ahead; -1: not in the queue.
+  int audioQueuePosition(const char *username, const unsigned char *guid) const;
+
+  VideoRecvState *findVideoStream(const char *username, int chidx);
+  VideoRecvState *findOrCreateVideoStream(const char *username, int chidx);
+  VideoRecvState *findVideoStreamByGUID(const unsigned char *guid);
+  void removeVideoStream(const char *username, int chidx);
 };
 
 
