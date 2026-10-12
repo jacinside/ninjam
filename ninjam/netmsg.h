@@ -37,7 +37,10 @@
 
 #define NET_MESSAGE_MAX_SIZE 16384
 
-#define NET_CON_MAX_MESSAGES 512
+// Room for video interval data alongside audio: a 300 kbps stream over 16 s
+// intervals is ~37 write messages per interval, so a few remote video
+// streams plus audio stay well under this.
+#define NET_CON_MAX_MESSAGES 2048
 
 #define MESSAGE_KEEPALIVE 0xfd
 #define MESSAGE_EXTENDED 0xfe
@@ -128,6 +131,10 @@ class Net_Connection
     }
 
     void Kill(int quick=0);
+
+    int GetSendQueueCount() const {
+      return m_sendq.Available() / (int)sizeof(Net_Message*);
+    }
 
   private:
     int m_error;

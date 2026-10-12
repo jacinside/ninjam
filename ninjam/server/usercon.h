@@ -41,8 +41,8 @@
 
 #define MAX_USER_CHANNELS 32
 #define MAX_USERS 64
-#define MAX_UPLOADS 32
-#define MAX_DOWNLOADS 128
+#define MAX_UPLOADS 64      // video channels: more concurrent interval uploads
+#define MAX_DOWNLOADS 512   // and downloads per user
 
 #define PRIV_TOPIC 1
 #define PRIV_CHATSEND 2

@@ -131,6 +131,11 @@ bool g_config_anonymous_mask_ip;
 int g_config_maxch_anon;
 int g_config_maxch_user;
 WDL_String g_config_logpath;
+bool g_config_allow_video_channels;     // advertise video support (server_caps bit 1)
+int g_config_video_transfer_timeout;    // seconds before a stale video transfer is dropped (default 30)
+int g_config_video_congestion_pct;      // % of a subscriber's send queue past which its video is dropped (default 50)
+int g_config_send_buffer_kb;            // per-connection TCP send buffer in KB (default 256)
+int g_config_recv_buffer_kb;            // per-connection TCP recv buffer in KB (default 128)
 int g_config_log_sessionlen;
 
 int g_config_max_users; // these all must be copied to User_Group
@@ -478,6 +483,45 @@ static int ConfigOnToken(LineParser *lp, bool is_init)
     }
     g_config_allow_hidden_users = !!x;
   }
+  else if (!stricmp(t,"AllowVideoChannels"))
+  {
+    if (lp->getnumtokens() != 2) return -1;
+
+    int x=lp->gettoken_enum(1,"no\0yes\0");
+    if (x <0)
+    {
+      return -2;
+    }
+    g_config_allow_video_channels=!!x;
+  }
+  else if (!stricmp(t,"VideoTransferTimeout"))
+  {
+    if (lp->getnumtokens() != 2) return -1;
+    int v=lp->gettoken_int(1);
+    if (v < 5 || v > 300) return -2;
+    g_config_video_transfer_timeout=v;
+  }
+  else if (!stricmp(t,"VideoCongestionThreshold"))
+  {
+    if (lp->getnumtokens() != 2) return -1;
+    int v=lp->gettoken_int(1);
+    if (v < 10 || v > 95) return -2;
+    g_config_video_congestion_pct=v;
+  }
+  else if (!stricmp(t,"SendBufferKB"))
+  {
+    if (lp->getnumtokens() != 2) return -1;
+    int v=lp->gettoken_int(1);
+    if (v < 64 || v > 4096) return -2;
+    g_config_send_buffer_kb=v;
+  }
+  else if (!stricmp(t,"RecvBufferKB"))
+  {
+    if (lp->getnumtokens() != 2) return -1;
+    int v=lp->gettoken_int(1);
+    if (v < 32 || v > 2048) return -2;
+    g_config_recv_buffer_kb=v;
+  }
   else if (!stricmp(t,"AnonymousUsers"))
   {
     if (lp->getnumtokens() != 2) return -1;
@@ -590,6 +634,12 @@ static int ReadConfig(char *configfile, bool is_init=false)
   g_default_bpm=120;
 
   g_config_log_sessionlen=10; // ten minute default, tho the user will need to specify the path anyway
+
+  g_config_allow_video_channels=false;
+  g_config_video_transfer_timeout=30;
+  g_config_video_congestion_pct=50;
+  g_config_send_buffer_kb=256;
+  g_config_recv_buffer_kb=128;
 
   g_config_max_users=0; // unlimited users
   g_config_motdfile.Set("");
@@ -970,6 +1020,13 @@ int main(int argc, char **argv)
     m_group->CreateUserLookup=myCreateUserLookup;
 
     logText("Using defaults %d BPM %d BPI\n",g_default_bpm,g_default_bpi);
+    logText("Video channels: %s\n",g_config_allow_video_channels?"enabled":"disabled");
+    if (g_config_allow_video_channels)
+    {
+      logText("  Video transfer timeout: %ds, congestion threshold: %d%%, send buffer: %dKB, recv buffer: %dKB\n",
+              g_config_video_transfer_timeout, g_config_video_congestion_pct,
+              g_config_send_buffer_kb, g_config_recv_buffer_kb);
+    }
     m_group->SetConfig(g_default_bpi,g_default_bpm);
 
     m_group->SetLicenseText(g_config_license.Get());
@@ -980,7 +1037,7 @@ int main(int argc, char **argv)
 #endif
     while (!g_done)
     {
-      JNL_IConnection *con=m_listener->get_connect(2*65536,65536);
+      JNL_IConnection *con=m_listener->get_connect(g_config_send_buffer_kb*1024, g_config_recv_buffer_kb*1024);
       if (con) 
       {
         char str[512];

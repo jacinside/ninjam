@@ -98,6 +98,37 @@ extern void logText(const char *s, ...);
 
 #define TRANSFER_TIMEOUT 8
 
+extern bool g_config_allow_video_channels;
+extern int g_config_video_transfer_timeout;
+extern int g_config_video_congestion_pct;
+
+// Video intervals use a video fourcc instead of OGGv. The server relays them
+// like any other interval; it only treats them differently for timeouts and
+// for dropping under congestion. fourcc is stored little-endian.
+static bool is_video_fourcc(unsigned int fourcc)
+{
+  unsigned char c[4];
+  c[0] = fourcc & 0xff;
+  c[1] = (fourcc >> 8) & 0xff;
+  c[2] = (fourcc >> 16) & 0xff;
+  c[3] = (fourcc >> 24) & 0xff;
+  return (c[0]=='H' && c[1]=='2' && c[2]=='6' && c[3]=='4') ||
+         (c[0]=='V' && c[1]=='P' && c[2]=='8') ||
+         (c[0]=='M' && c[1]=='J' && c[2]=='P' && c[3]=='G');
+}
+
+// A subscriber whose send queue is past the threshold gets no new video, so
+// video can't build a backlog that delays its audio.
+static bool video_congested(Net_Connection &nc)
+{
+  return nc.GetSendQueueCount() > NET_CON_MAX_MESSAGES * g_config_video_congestion_pct / 100;
+}
+
+static int transfer_timeout(unsigned int fourcc)
+{
+  return is_video_fourcc(fourcc) ? g_config_video_transfer_timeout : TRANSFER_TIMEOUT;
+}
+
 User_Connection::User_Connection(JNL_IConnection *con, User_Group *grp) : m_auth_state(0), m_clientcaps(0), m_auth_privs(0), m_reserved(0), m_max_channels(0),
       m_vote_bpm(0), m_vote_bpm_lasttime(0), m_vote_bpi(0), m_vote_bpi_lasttime(0)
 {
@@ -115,6 +146,7 @@ User_Connection::User_Connection(JNL_IConnection *con, User_Group *grp) : m_auth
   if (ka < 0)ka=0;
   else if (ka > 255) ka=255;
   ch.server_caps=ka<<8;
+  if (g_config_allow_video_channels) ch.server_caps |= 2; // bit 1: video channels supported
 
   if (grp->m_licensetext.Get()[0])
   {
@@ -752,6 +784,9 @@ int User_Connection::Run(User_Group *group, int *wantsleep)
                   {
                     if (sm->channelmask & (1<<mp.chidx))
                     {
+                      if (is_video_fourcc(mp.fourcc) && video_congested(u->m_netcon))
+                        break; // skip this video interval for a congested subscriber
+
                       if (memcmp(mp.guid,zero_guid,sizeof(zero_guid))) // zero = silence, so simply rebroadcast
                       {
                         // add entry in send list
@@ -805,7 +840,7 @@ int User_Connection::Run(User_Group *group, int *wantsleep)
                 }
                 break;
               }
-              if (now-t->last_acttime > TRANSFER_TIMEOUT)
+              if (now-t->last_acttime > transfer_timeout(t->fourcc))
               {
                 delete t;
                 m_recvfiles.Delete(x--);
@@ -824,6 +859,17 @@ int User_Connection::Run(User_Group *group, int *wantsleep)
                   User_TransferState *t=u->m_sendfiles.Get(i);
                   if (t && !memcmp(t->guid,mp.guid,sizeof(t->guid)))
                   {
+                    if (is_video_fourcc(t->fourcc) && video_congested(u->m_netcon))
+                    {
+                      // drop this video chunk for a congested subscriber
+                      t->bytes_sofar += mp.audio_data_len;
+                      if (mp.flags & 1)
+                      {
+                        delete t;
+                        u->m_sendfiles.Delete(i);
+                      }
+                      break;
+                    }
                     t->last_acttime=now;
                     t->bytes_sofar += mp.audio_data_len;
                     u->Send(msg);
@@ -835,7 +881,7 @@ int User_Connection::Run(User_Group *group, int *wantsleep)
                     }
                     break;
                   }
-                  if (now-t->last_acttime > TRANSFER_TIMEOUT)
+                  if (now-t->last_acttime > transfer_timeout(t->fourcc))
                   {
                     delete t;
                     u->m_sendfiles.Delete(i--);
