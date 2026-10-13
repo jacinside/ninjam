@@ -3,7 +3,9 @@ CFLAGS = -O2 -Wall -Wno-reorder
 ifdef MAC
 CFLAGS += -D_MAC
 else
-CFLAGS += -pthread
+# WDL requires a signed plain char (wdltypes.h asserts it); it is unsigned by
+# default on arm64 and other non-x86 Linux targets
+CFLAGS += -pthread -fsigned-char
 endif
 
 CC=gcc
