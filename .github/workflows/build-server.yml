@@ -1,0 +1,29 @@
+name: build-server
+
+on:
+  push:
+    branches: [community]
+  pull_request:
+    branches: [community]
+  workflow_dispatch:
+
+jobs:
+  ninjamsrv:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build ninjamsrv
+        working-directory: ninjam/server
+        run: make -j"$(nproc)"
+      - name: Smoke test
+        working-directory: ninjam/server
+        run: |
+          uname -m
+          # with no config file the server prints its usage and exits with 1
+          out="$(./ninjamsrv 2>&1 || true)"
+          echo "$out" | head -2
+          grep -q "Usage: NINJAMserver" <<< "$out"
